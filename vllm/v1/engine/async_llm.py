@@ -77,6 +77,11 @@ from vllm.v1.metrics.stats import IterationStats
 
 logger = init_logger(__name__)
 
+#: vllm-arc patch 0001 (retained streaming pooling sessions on 0.33.0).
+ARC_PATCH = "0001-retained-pooling-session"
+#: The pooling extra_kwargs key that marks a per-input (GATHER) pooler.
+ARC_STREAMING_POOLING_KEY = "arc_gather"
+
 
 class InputStreamError(Exception):
     """Wrapper for errors from the input stream generator.
@@ -615,7 +620,11 @@ class AsyncLLM(EngineClient):
             kv_hints=kv_hints,
         )
 
-        if not sampling_params.skip_clone:
+        if isinstance(sampling_params, PoolingParams):
+            # ARC 0001: PoolingParams has no skip_clone; clone once so input
+            # processing never mutates the caller's session parameters.
+            sampling_params = sampling_params.clone()
+        elif not sampling_params.skip_clone:
             sampling_params = sampling_params.clone()
             sampling_params.skip_clone = True
 
@@ -706,6 +715,23 @@ class AsyncLLM(EngineClient):
     def _validate_streaming_input_sampling_params(
         params: SamplingParams | PoolingParams,
     ):
+        if isinstance(params, PoolingParams):
+            # ARC 0001: a retained pooling session. Only a pooler that reads
+            # each input's own positions (the vllm-arc GATHER pooler, keyed
+            # by extra_kwargs["arc_gather"]) is correct per input: a stock
+            # MEAN/ALL pooler would silently pool the new input alone. The
+            # first input must not read the prefix cache (later inputs never
+            # look it up: the session's own KV and state are retained).
+            if not (params.extra_kwargs or {}).get(ARC_STREAMING_POOLING_KEY):
+                raise VLLMValidationError(
+                    "Input streaming for pooling requires extra_kwargs"
+                    f"[{ARC_STREAMING_POOLING_KEY!r}] (patch {ARC_PATCH})."
+                )
+            if params.skip_reading_prefix_cache is False:
+                raise VLLMValidationError(
+                    "Pooling input streaming cannot read the prefix cache."
+                )
+            return
         if (
             not isinstance(params, SamplingParams)
             or params.n > 1
@@ -1033,7 +1059,7 @@ class AsyncLLM(EngineClient):
 
     async def encode(
         self,
-        prompt: PromptType | EngineInput,
+        prompt: PromptType | EngineInput | AsyncGenerator[StreamingInput, None],
         pooling_params: PoolingParams,
         request_id: str,
         lora_request: LoRARequest | None = None,
@@ -1074,6 +1100,9 @@ class AsyncLLM(EngineClient):
                 # Note: drain queue without await if possible (avoids
                 # task switching under load which helps performance).
                 out = q.get_nowait() or await q.get()
+                if out is STREAM_FINISHED:
+                    # ARC 0001: a streamed pooling session's input ended.
+                    break
                 assert isinstance(out, PoolingRequestOutput)
                 # Note: both OutputProcessor and EngineCore handle their
                 # own request cleanup based on finished.
@@ -1081,8 +1110,9 @@ class AsyncLLM(EngineClient):
                 yield out
 
         # If the request is disconnected by the client, generate()
-        # is cancelled. So, we abort the request if we end up here.
-        except asyncio.CancelledError:
+        # is cancelled (or a streamed session's generator is closed).
+        # So, we abort the request if we end up here.
+        except (asyncio.CancelledError, GeneratorExit):
             if q is not None:
                 await self.abort(q.request_id, internal=True)
             if self.log_requests:

@@ -1883,8 +1883,9 @@ class Scheduler(SchedulerInterface):
 
         Discards the last sampled output token from the prior input chunk.
         """
-        # Keep all output tokens but the final sampled one.
-        keep_end = session.num_tokens - 1
+        # Keep all output tokens but the final sampled one. ARC 0001: a
+        # pooling session samples nothing, so it keeps every token.
+        keep_end = session.num_tokens - (session.pooling_params is None)
         assert keep_end >= session.num_computed_tokens
         kept_output_tokens = session._all_token_ids[
             session.num_prompt_tokens : keep_end
@@ -1911,6 +1912,10 @@ class Scheduler(SchedulerInterface):
         session.num_prompt_tokens = len(session.prompt_token_ids)
         session.arrival_time = update.arrival_time
         session.sampling_params = update.sampling_params
+        if update.pooling_params is not None:
+            # ARC 0001: per-input pooling parameters reach the worker through
+            # the re-sent NewRequestData.
+            session.pooling_params = update.pooling_params
         session.max_tokens = update.max_tokens
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             self.num_waiting_for_streaming_input -= 1

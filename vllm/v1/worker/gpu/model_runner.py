@@ -70,7 +70,11 @@ from vllm.tasks import SupportedTask
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
-from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.core.sched.output import (
+    GrammarOutput,
+    NewRequestData,
+    SchedulerOutput,
+)
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
@@ -1212,10 +1216,110 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if outputs is not None:
                 self.postprocess_sampled(**outputs)
 
+    def _arc_extend_request(self, new_req_data: NewRequestData) -> bool:
+        """ARC 0001: resume a retained pooling session in place.
+
+        A streamed pooling input re-sends the whole session (all token ids
+        and block ids). The session's slot already holds every token before
+        `num_computed_tokens`, so only the new token ids, their M-RoPE
+        positions and the new block ids are written; the pooling state is
+        fresh, as for a re-added request. Returns False (the caller re-adds
+        the request in full, as stock does) for anything else: generation,
+        an unknown request, a non-extending update, or an update that brings
+        a multimodal item (a feature whose span ends past the held tokens).
+        A session's features accumulate across updates, so features wholly
+        inside the held prefix do not count: a text update after an image
+        extends. `arc_extends` counts the extensions.
+        """
+        req_id = new_req_data.req_id
+        req_index = self.req_states.req_id_to_index.get(req_id)
+        token_ids = new_req_data.prefill_token_ids
+        if (
+            self.pooling_runner is None
+            or req_index is None
+            or new_req_data.pooling_params is None
+            or new_req_data.prompt_embeds is not None
+            or self.pp_handler is not None
+            or self.adaptive_verification is not None
+            or self.req_states.num_speculative_steps > 0
+            or token_ids is None
+        ):
+            return False
+        old_len = int(self.req_states.prefill_len.np[req_index])
+        new_len = len(token_ids)
+        num_computed = new_req_data.num_computed_tokens
+        if num_computed != old_len or new_len <= old_len:
+            return False
+        if any(
+            f.mm_position.offset + f.mm_position.length > old_len
+            for f in new_req_data.mm_features
+        ):
+            return False
+        if any(
+            len(ids) < self.block_tables.num_blocks.np[g, req_index]
+            for g, ids in enumerate(new_req_data.block_ids)
+        ):
+            return False
+
+        states = self.req_states
+        states.max_seq_len[req_index] = new_req_data.prompt_len + 1
+        states.prompt_len.np[req_index] = new_req_data.prompt_len
+        states.prefill_len.np[req_index] = new_len
+        states.total_len.stage_write_elem(req_index, new_len)
+        states.all_token_ids.stage_write(req_index, old_len, token_ids[old_len:])
+        states.num_computed_prefill_tokens[req_index] = num_computed
+        states.num_computed_tokens_np[req_index] = num_computed
+        states.num_computed_tokens.stage_write_elem(req_index, num_computed)
+
+        self.pooling_runner.remove_request(req_index)
+        self.pooling_runner.add_request(
+            req_id,
+            req_index,
+            new_req_data.pooling_params,
+            new_req_data.prompt_token_ids,
+        )
+        # Every model-state hook but the M-RoPE prefill positions, which are
+        # written for the new tokens only: a text token at i past the last
+        # multimodal item sits at i + delta in every dimension.
+        rope_state = getattr(self.model_state, "rope_state", None)
+        self.model_state.remove_request(req_id)
+        if rope_state is not None:
+            self.model_state.rope_state = None
+        try:
+            self.model_state.add_request(req_index, new_req_data)
+        finally:
+            if rope_state is not None:
+                self.model_state.rope_state = rope_state
+        if rope_state is not None:
+            delta = int(rope_state.prefill_delta.np[req_index])
+            positions = list(range(old_len + delta, new_len + delta))
+            for dim in range(rope_state.num_dims):
+                rope_state.prefill_positions.stage_write(
+                    rope_state.num_dims * req_index + dim, old_len, positions
+                )
+        self.block_tables.append_block_ids(
+            req_index,
+            tuple(
+                ids[self.block_tables.num_blocks.np[g, req_index] :]
+                for g, ids in enumerate(new_req_data.block_ids)
+            ),
+            overwrite=False,
+        )
+        if self.encoder_cache is not None:
+            # As stock's re-add: the update's (empty) multimodal features.
+            self.encoder_cache.remove_request(req_id)
+            self.encoder_cache.add_request(req_id, new_req_data.mm_features)
+        self.lora_state.remove_request(req_id)
+        self.lora_state.add_request(req_id, req_index, new_req_data.lora_request)
+        self.arc_extends = getattr(self, "arc_extends", 0) + 1
+        return True
+
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
         for new_req_data in scheduler_output.scheduled_new_reqs:
             assert new_req_data.prefill_token_ids is not None
             req_id = new_req_data.req_id
+            if self._arc_extend_request(new_req_data):
+                continue
 
             # Streaming input update: request already exists from a prior
             # chunk. Remove old state so it can be cleanly re-added below

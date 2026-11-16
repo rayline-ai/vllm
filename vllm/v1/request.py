@@ -43,6 +43,9 @@ class StreamingUpdate:
     max_tokens: int
     arrival_time: float
     sampling_params: SamplingParams | None
+    # ARC 0001: a retained pooling session's input carries its own pooling
+    # parameters (e.g. GATHER readout offsets).
+    pooling_params: PoolingParams | None = None
 
     @classmethod
     def from_request(cls, request: "Request") -> "StreamingUpdate | None":
@@ -54,6 +57,7 @@ class StreamingUpdate:
             max_tokens=request.max_tokens,
             arrival_time=request.arrival_time,
             sampling_params=request.sampling_params,
+            pooling_params=request.pooling_params,
         )
 
 
