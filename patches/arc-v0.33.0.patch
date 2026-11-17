@@ -1,0 +1,292 @@
+From dca0ed16e564ab048405888952fd86f56ef9335a Mon Sep 17 00:00:00 2001
+From: Chi Lang <chilang@gmail.com>
+Date: Mon, 16 Nov 2026 15:06:45 +0000
+Subject: [PATCH] [V1][Pooling] Incremental pooling sessions: streaming input
+ and in-place extend
+
+A pooling request can take streaming input: each update carries new tokens
+(with per-input readout offsets in PoolingParams.extra_kwargs["arc_gather"])
+and resumes the paused session with the update's params. On the V2 GPU model
+runner a resumed text-only request is extended in place, writing only the new
+token ids, M-RoPE positions and block ids; stock re-adds the whole request
+(O(session length)) on every append. An update that brings an image takes the
+existing full re-add.
+
+Modified by Atlas Futures, Inc., 2026 (Apache License 2.0, section 4(b)).
+Files: vllm/v1/core/sched/scheduler.py, vllm/v1/engine/async_llm.py,
+vllm/v1/request.py, vllm/v1/worker/gpu/model_runner.py.
+
+Upstream: not yet offered (planned RFC: incremental pooling sessions).
+
+Signed-off-by: Chi Lang <chilang@gmail.com>
+---
+ vllm/v1/core/sched/scheduler.py    |   9 ++-
+ vllm/v1/engine/async_llm.py        |  38 +++++++++--
+ vllm/v1/request.py                 |   4 ++
+ vllm/v1/worker/gpu/model_runner.py | 106 ++++++++++++++++++++++++++++-
+ 4 files changed, 150 insertions(+), 7 deletions(-)
+
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index d35b7dfac4..4026babcf6 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1883,8 +1883,9 @@ class Scheduler(SchedulerInterface):
+ 
+         Discards the last sampled output token from the prior input chunk.
+         """
+-        # Keep all output tokens but the final sampled one.
+-        keep_end = session.num_tokens - 1
++        # Keep all output tokens but the final sampled one. ARC 0001: a
++        # pooling session samples nothing, so it keeps every token.
++        keep_end = session.num_tokens - (session.pooling_params is None)
+         assert keep_end >= session.num_computed_tokens
+         kept_output_tokens = session._all_token_ids[
+             session.num_prompt_tokens : keep_end
+@@ -1911,6 +1912,10 @@ class Scheduler(SchedulerInterface):
+         session.num_prompt_tokens = len(session.prompt_token_ids)
+         session.arrival_time = update.arrival_time
+         session.sampling_params = update.sampling_params
++        if update.pooling_params is not None:
++            # ARC 0001: per-input pooling parameters reach the worker through
++            # the re-sent NewRequestData.
++            session.pooling_params = update.pooling_params
+         session.max_tokens = update.max_tokens
+         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+             self.num_waiting_for_streaming_input -= 1
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index 9fdf687d13..f80ea73703 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -77,6 +77,11 @@ from vllm.v1.metrics.stats import IterationStats
+ 
+ logger = init_logger(__name__)
+ 
++#: vllm-arc patch 0001 (retained streaming pooling sessions on 0.33.0).
++ARC_PATCH = "0001-retained-pooling-session"
++#: The pooling extra_kwargs key that marks a per-input (GATHER) pooler.
++ARC_STREAMING_POOLING_KEY = "arc_gather"
++
+ 
+ class InputStreamError(Exception):
+     """Wrapper for errors from the input stream generator.
+@@ -615,7 +620,11 @@ class AsyncLLM(EngineClient):
+             kv_hints=kv_hints,
+         )
+ 
+-        if not sampling_params.skip_clone:
++        if isinstance(sampling_params, PoolingParams):
++            # ARC 0001: PoolingParams has no skip_clone; clone once so input
++            # processing never mutates the caller's session parameters.
++            sampling_params = sampling_params.clone()
++        elif not sampling_params.skip_clone:
+             sampling_params = sampling_params.clone()
+             sampling_params.skip_clone = True
+ 
+@@ -706,6 +715,23 @@ class AsyncLLM(EngineClient):
+     def _validate_streaming_input_sampling_params(
+         params: SamplingParams | PoolingParams,
+     ):
++        if isinstance(params, PoolingParams):
++            # ARC 0001: a retained pooling session. Only a pooler that reads
++            # each input's own positions (the vllm-arc GATHER pooler, keyed
++            # by extra_kwargs["arc_gather"]) is correct per input: a stock
++            # MEAN/ALL pooler would silently pool the new input alone. The
++            # first input must not read the prefix cache (later inputs never
++            # look it up: the session's own KV and state are retained).
++            if not (params.extra_kwargs or {}).get(ARC_STREAMING_POOLING_KEY):
++                raise VLLMValidationError(
++                    "Input streaming for pooling requires extra_kwargs"
++                    f"[{ARC_STREAMING_POOLING_KEY!r}] (patch {ARC_PATCH})."
++                )
++            if params.skip_reading_prefix_cache is False:
++                raise VLLMValidationError(
++                    "Pooling input streaming cannot read the prefix cache."
++                )
++            return
+         if (
+             not isinstance(params, SamplingParams)
+             or params.n > 1
+@@ -1033,7 +1059,7 @@ class AsyncLLM(EngineClient):
+ 
+     async def encode(
+         self,
+-        prompt: PromptType | EngineInput,
++        prompt: PromptType | EngineInput | AsyncGenerator[StreamingInput, None],
+         pooling_params: PoolingParams,
+         request_id: str,
+         lora_request: LoRARequest | None = None,
+@@ -1074,6 +1100,9 @@ class AsyncLLM(EngineClient):
+                 # Note: drain queue without await if possible (avoids
+                 # task switching under load which helps performance).
+                 out = q.get_nowait() or await q.get()
++                if out is STREAM_FINISHED:
++                    # ARC 0001: a streamed pooling session's input ended.
++                    break
+                 assert isinstance(out, PoolingRequestOutput)
+                 # Note: both OutputProcessor and EngineCore handle their
+                 # own request cleanup based on finished.
+@@ -1081,8 +1110,9 @@ class AsyncLLM(EngineClient):
+                 yield out
+ 
+         # If the request is disconnected by the client, generate()
+-        # is cancelled. So, we abort the request if we end up here.
+-        except asyncio.CancelledError:
++        # is cancelled (or a streamed session's generator is closed).
++        # So, we abort the request if we end up here.
++        except (asyncio.CancelledError, GeneratorExit):
+             if q is not None:
+                 await self.abort(q.request_id, internal=True)
+             if self.log_requests:
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index 4b1b9ecc2e..be140a73a0 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -43,6 +43,9 @@ class StreamingUpdate:
+     max_tokens: int
+     arrival_time: float
+     sampling_params: SamplingParams | None
++    # ARC 0001: a retained pooling session's input carries its own pooling
++    # parameters (e.g. GATHER readout offsets).
++    pooling_params: PoolingParams | None = None
+ 
+     @classmethod
+     def from_request(cls, request: "Request") -> "StreamingUpdate | None":
+@@ -54,6 +57,7 @@ class StreamingUpdate:
+             max_tokens=request.max_tokens,
+             arrival_time=request.arrival_time,
+             sampling_params=request.sampling_params,
++            pooling_params=request.pooling_params,
+         )
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index df254fe314..ba25b57829 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -70,7 +70,11 @@ from vllm.tasks import SupportedTask
+ from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
+ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
+ from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
+-from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
++from vllm.v1.core.sched.output import (
++    GrammarOutput,
++    NewRequestData,
++    SchedulerOutput,
++)
+ from vllm.v1.kv_cache_interface import (
+     KVCacheConfig,
+     MambaSpec,
+@@ -1212,10 +1216,110 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             if outputs is not None:
+                 self.postprocess_sampled(**outputs)
+ 
++    def _arc_extend_request(self, new_req_data: NewRequestData) -> bool:
++        """ARC 0001: resume a retained pooling session in place.
++
++        A streamed pooling input re-sends the whole session (all token ids
++        and block ids). The session's slot already holds every token before
++        `num_computed_tokens`, so only the new token ids, their M-RoPE
++        positions and the new block ids are written; the pooling state is
++        fresh, as for a re-added request. Returns False (the caller re-adds
++        the request in full, as stock does) for anything else: generation,
++        an unknown request, a non-extending update, or an update that brings
++        a multimodal item (a feature whose span ends past the held tokens).
++        A session's features accumulate across updates, so features wholly
++        inside the held prefix do not count: a text update after an image
++        extends. `arc_extends` counts the extensions.
++        """
++        req_id = new_req_data.req_id
++        req_index = self.req_states.req_id_to_index.get(req_id)
++        token_ids = new_req_data.prefill_token_ids
++        if (
++            self.pooling_runner is None
++            or req_index is None
++            or new_req_data.pooling_params is None
++            or new_req_data.prompt_embeds is not None
++            or self.pp_handler is not None
++            or self.adaptive_verification is not None
++            or self.req_states.num_speculative_steps > 0
++            or token_ids is None
++        ):
++            return False
++        old_len = int(self.req_states.prefill_len.np[req_index])
++        new_len = len(token_ids)
++        num_computed = new_req_data.num_computed_tokens
++        if num_computed != old_len or new_len <= old_len:
++            return False
++        if any(
++            f.mm_position.offset + f.mm_position.length > old_len
++            for f in new_req_data.mm_features
++        ):
++            return False
++        if any(
++            len(ids) < self.block_tables.num_blocks.np[g, req_index]
++            for g, ids in enumerate(new_req_data.block_ids)
++        ):
++            return False
++
++        states = self.req_states
++        states.max_seq_len[req_index] = new_req_data.prompt_len + 1
++        states.prompt_len.np[req_index] = new_req_data.prompt_len
++        states.prefill_len.np[req_index] = new_len
++        states.total_len.stage_write_elem(req_index, new_len)
++        states.all_token_ids.stage_write(req_index, old_len, token_ids[old_len:])
++        states.num_computed_prefill_tokens[req_index] = num_computed
++        states.num_computed_tokens_np[req_index] = num_computed
++        states.num_computed_tokens.stage_write_elem(req_index, num_computed)
++
++        self.pooling_runner.remove_request(req_index)
++        self.pooling_runner.add_request(
++            req_id,
++            req_index,
++            new_req_data.pooling_params,
++            new_req_data.prompt_token_ids,
++        )
++        # Every model-state hook but the M-RoPE prefill positions, which are
++        # written for the new tokens only: a text token at i past the last
++        # multimodal item sits at i + delta in every dimension.
++        rope_state = getattr(self.model_state, "rope_state", None)
++        self.model_state.remove_request(req_id)
++        if rope_state is not None:
++            self.model_state.rope_state = None
++        try:
++            self.model_state.add_request(req_index, new_req_data)
++        finally:
++            if rope_state is not None:
++                self.model_state.rope_state = rope_state
++        if rope_state is not None:
++            delta = int(rope_state.prefill_delta.np[req_index])
++            positions = list(range(old_len + delta, new_len + delta))
++            for dim in range(rope_state.num_dims):
++                rope_state.prefill_positions.stage_write(
++                    rope_state.num_dims * req_index + dim, old_len, positions
++                )
++        self.block_tables.append_block_ids(
++            req_index,
++            tuple(
++                ids[self.block_tables.num_blocks.np[g, req_index] :]
++                for g, ids in enumerate(new_req_data.block_ids)
++            ),
++            overwrite=False,
++        )
++        if self.encoder_cache is not None:
++            # As stock's re-add: the update's (empty) multimodal features.
++            self.encoder_cache.remove_request(req_id)
++            self.encoder_cache.add_request(req_id, new_req_data.mm_features)
++        self.lora_state.remove_request(req_id)
++        self.lora_state.add_request(req_id, req_index, new_req_data.lora_request)
++        self.arc_extends = getattr(self, "arc_extends", 0) + 1
++        return True
++
+     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+         for new_req_data in scheduler_output.scheduled_new_reqs:
+             assert new_req_data.prefill_token_ids is not None
+             req_id = new_req_data.req_id
++            if self._arc_extend_request(new_req_data):
++                continue
+ 
+             # Streaming input update: request already exists from a prior
+             # chunk. Remove old state so it can be cleanly re-added below
+-- 
+2.47.3
+
